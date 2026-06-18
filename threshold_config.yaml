@@ -1,0 +1,58 @@
+# Trend Chart Threshold Configuration
+# 用于配置trend图中的阈值线和平均值线
+
+# Threshold values for trend charts
+thresholds:
+  # Memory Usage (%)
+  memory_usage:
+    average: true      # 是否显示平均值线
+    warning: 50        # Warning阈值 (黄色实线)
+    error: 80          # Error阈值 (红色实线)
+    show_warning: true
+    show_error: true
+
+  # CPU Load
+  cpu_load:
+    average: true
+    warning: 80
+    error: 95
+    show_warning: true
+    show_error: true
+
+  # Temperature (°C)
+  temperature:
+    average: true
+    warning: 55
+    error: 85
+    show_warning: true
+    show_error: true
+
+  # Clients (连接数) - 只有平均值线，没有阈值
+  clients:
+    average: true
+    show_warning: false
+    show_error: false
+
+# 线条样式配置
+line_styles:
+  average:
+    color: "#555555"  # 深灰色
+    linestyle: "--"
+    linewidth: 1.5
+    label: "Average"
+  warning:
+    color: "#FFA500"  # 橙色
+    linestyle: "-"
+    linewidth: 1.5
+    label: "Warning"
+  error:
+    color: "#FF0000"  # 红色
+    linestyle: "-"
+    linewidth: 2
+    label: "Error"
+
+# 图表配置
+chart_config:
+  dpi: 150
+  figure_width: 10
+  figure_height: 5

@@ -1,4 +1,4 @@
-"""数据分析和图表生成模块 - 完整版（包含趋势图）"""
+"""数据分析和图表生成模块 - 完整版（包含趋势图和阈值线）"""
 import json
 import pandas as pd
 import numpy as np
@@ -11,10 +11,56 @@ import matplotlib.dates as mdates
 from openpyxl.drawing.image import Image
 import tempfile
 import shutil
+import yaml
 
 # 设置中文字体
 plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'SimHei', 'Arial']
 plt.rcParams['axes.unicode_minus'] = False
+
+# 配置文件路径
+SCRIPT_DIR = Path(__file__).parent
+SKILL_DIR = SCRIPT_DIR.parent
+THRESHOLD_CONFIG_FILE = SKILL_DIR / 'threshold_config.yaml'
+
+
+def load_threshold_config() -> dict:
+    """加载阈值配置文件"""
+    default_config = {
+        'thresholds': {
+            'memory_usage': {'average': True, 'warning': 50, 'error': 80, 'show_warning': True, 'show_error': True},
+            'cpu_load': {'average': True, 'warning': 80, 'error': 95, 'show_warning': True, 'show_error': True},
+            'temperature': {'average': True, 'warning': 70, 'error': 85, 'show_warning': True, 'show_error': True},
+            'clients': {'average': True, 'show_warning': False, 'show_error': False}
+        },
+        'line_styles': {
+            'average': {'color': '#555555', 'linestyle': '--', 'linewidth': 1.5, 'label': 'Average'},
+            'warning': {'color': '#FFA500', 'linestyle': '-', 'linewidth': 1.5, 'label': 'Warning'},
+            'error': {'color': '#FF0000', 'linestyle': '-', 'linewidth': 2, 'label': 'Error'}
+        },
+        'chart_config': {'dpi': 150, 'figure_width': 10, 'figure_height': 5}
+    }
+    
+    if THRESHOLD_CONFIG_FILE.exists():
+        try:
+            with open(THRESHOLD_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                user_config = yaml.safe_load(f)
+                # 深度合并配置
+                merged = default_config.copy()
+                for key, value in user_config.items():
+                    if isinstance(value, dict) and key in merged:
+                        merged[key].update(value)
+                    else:
+                        merged[key] = value
+                return merged
+        except Exception as e:
+            print(f"警告: 阈值配置文件加载失败，使用默认配置: {e}")
+            return default_config
+    else:
+        print(f"提示: 阈值配置文件不存在，使用默认配置: {THRESHOLD_CONFIG_FILE}")
+        return default_config
+
+
+THRESHOLD_CONFIG = load_threshold_config()
 
 
 class DataAnalyzer:
@@ -68,6 +114,7 @@ class DataAnalyzer:
                         'memory_usage': [],
                         'uptime_seconds': [],
                         'client_count': [],
+                        'temperature': [],
                         'channel_2g': [],
                         'channel_5g': [],
                         'channel_6g': [],
@@ -85,6 +132,7 @@ class DataAnalyzer:
                 device_history[serial]['memory_usage'].append(device.get('memory_usage'))
                 device_history[serial]['uptime_seconds'].append(uptime_seconds)
                 device_history[serial]['client_count'].append(device.get('total_clients', 0))
+                device_history[serial]['temperature'].append(device.get('temperature'))
                 
                 # 信道数据
                 radios_2g = device.get('radios_2g', {})
@@ -121,33 +169,113 @@ class DataAnalyzer:
         return np.nan
     
     def _create_trend_chart(self, df: pd.DataFrame, x_col: str, y_col: str, 
-                            title: str, ylabel: str, output_path: Path) -> Path:
-        """创建趋势图并保存为图片"""
+                            title: str, ylabel: str, output_path: Path,
+                            chart_type: str = None) -> Path:
+        """创建趋势图并保存为图片（支持阈值线和平均值线）"""
         valid_data = df[[x_col, y_col]].dropna()
         if len(valid_data) < 2:
             return None
         
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(valid_data[x_col], valid_data[y_col], marker='o', linewidth=2, markersize=6, color='steelblue')
+        # 获取图表配置
+        chart_cfg = THRESHOLD_CONFIG.get('chart_config', {})
+        dpi = chart_cfg.get('dpi', 150)
+        fig_width = chart_cfg.get('figure_width', 10)
+        fig_height = chart_cfg.get('figure_height', 5)
+        
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+        
+        # 绘制主数据线
+        ax.plot(valid_data[x_col], valid_data[y_col], marker='o', linewidth=2, markersize=6, color='steelblue', label='Actual')
+        
+        # 获取阈值配置
+        thresholds = THRESHOLD_CONFIG.get('thresholds', {})
+        line_styles = THRESHOLD_CONFIG.get('line_styles', {})
+        
+        # 根据chart_type获取对应的阈值配置
+        if chart_type is None:
+            chart_type = self._get_chart_type(y_col)
+        
+        threshold_cfg = thresholds.get(chart_type, {})
+        show_average = threshold_cfg.get('average', False)
+        show_warning = threshold_cfg.get('show_warning', False)
+        show_error = threshold_cfg.get('show_error', False)
+        
+        # 获取数据值的范围，用于决定是否显示某些线
+        y_values = valid_data[y_col].values
+        y_min, y_max = np.nanmin(y_values), np.nanmax(y_values)
+        
+        # 绘制平均值线
+        if show_average:
+            avg_style = line_styles.get('average', {})
+            avg_value = np.nanmean(y_values)
+            # 只有当平均值在数据范围内时有意义才显示
+            if y_min <= avg_value <= y_max * 1.5:
+                ax.axhline(y=avg_value, 
+                          color=avg_style.get('color', 'gray'),
+                          linestyle=avg_style.get('linestyle', '--'),
+                          linewidth=avg_style.get('linewidth', 1.5),
+                          label=avg_style.get('label', 'Average'))
+        
+        # 绘制Warning线
+        if show_warning and 'warning' in threshold_cfg:
+            warn_value = threshold_cfg['warning']
+            warn_style = line_styles.get('warning', {})
+            # 只有当Warning值在数据范围内或略高于数据时才显示
+            if y_min <= warn_value <= y_max * 1.2:
+                ax.axhline(y=warn_value,
+                          color=warn_style.get('color', '#FFA500'),
+                          linestyle=warn_style.get('linestyle', '-'),
+                          linewidth=warn_style.get('linewidth', 1.5),
+                          label=warn_style.get('label', 'Warning'))
+        
+        # 绘制Error线（只要数据接近或超过Error阈值就显示，全超标也保留警示）
+        if show_error and 'error' in threshold_cfg:
+            error_value = threshold_cfg['error']
+            error_style = line_styles.get('error', {})
+            if error_value <= y_max * 1.5:
+                ax.axhline(y=error_value,
+                          color=error_style.get('color', '#FF0000'),
+                          linestyle=error_style.get('linestyle', '-'),
+                          linewidth=error_style.get('linewidth', 2),
+                          label=error_style.get('label', 'Error'))
+        
+        # 设置图表标题和标签
         ax.set_title(title, fontsize=14, fontweight='bold')
         ax.set_xlabel('Date', fontsize=12)
         ax.set_ylabel(ylabel, fontsize=12)
         ax.grid(True, alpha=0.3)
         
+        # 添加图例
+        ax.legend(loc='upper right', fontsize=10)
+        
+        # 设置X轴日期格式
         ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
         if len(valid_data) > 1:
             ax.xaxis.set_major_locator(mdates.DayLocator(interval=max(1, len(valid_data)//5)))
         plt.xticks(rotation=45, ha='right')
         
         plt.tight_layout()
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
         plt.close()
         
         return output_path
     
+    def _get_chart_type(self, y_col: str) -> str:
+        """根据y列名获取chart类型"""
+        y_col_lower = y_col.lower()
+        if 'memory' in y_col_lower:
+            return 'memory_usage'
+        elif 'cpu' in y_col_lower:
+            return 'cpu_load'
+        elif 'temperature' in y_col_lower or 'temp' in y_col_lower:
+            return 'temperature'
+        elif 'client' in y_col_lower:
+            return 'clients'
+        return 'default'
+    
     def _create_channel_chart(self, df: pd.DataFrame, x_col: str, channel_col: str,
                               title: str, output_path: Path) -> Path:
-        """创建信道变化图"""
+        """创建信道变化图（不带阈值线）"""
         channel_values = []
         valid_dates = []
         
@@ -227,6 +355,7 @@ class DataAnalyzer:
             'CPU_Load_15m': history['cpu_load'],
             'Memory_Usage(%)': history['memory_usage'],
             'Uptime_Hours': [s / 3600 if not np.isnan(s) else np.nan for s in history['uptime_seconds']],
+            'Temperature(°C)': history['temperature'],
             'Clients': history['client_count'],
             '2G_Channel': history['channel_2g'],
             '5G_Channel': history['channel_5g'],
@@ -255,33 +384,38 @@ class DataAnalyzer:
         charts = []
         
         if len(df) >= 2:
-            # CPU Load Trend
+            # CPU Load Trend (带阈值线)
             cpu_path = temp_dir / f"{serial}_cpu.png"
-            if self._create_trend_chart(df, 'Date', 'CPU_Load_15m', 'CPU Load Trend', 'CPU Load', cpu_path):
+            if self._create_trend_chart(df, 'Date', 'CPU_Load_15m', 'CPU Load Trend', 'CPU Load', cpu_path, chart_type='cpu_load'):
                 charts.append(('CPU Load Trend', cpu_path))
             
-            # Memory Usage Trend
+            # Memory Usage Trend (带阈值线)
             mem_path = temp_dir / f"{serial}_memory.png"
-            if self._create_trend_chart(df, 'Date', 'Memory_Usage(%)', 'Memory Usage Trend', 'Memory Usage (%)', mem_path):
+            if self._create_trend_chart(df, 'Date', 'Memory_Usage(%)', 'Memory Usage Trend', 'Memory Usage (%)', mem_path, chart_type='memory_usage'):
                 charts.append(('Memory Usage Trend', mem_path))
             
-            # Clients Trend
+            # Clients Trend (带平均值线)
             client_path = temp_dir / f"{serial}_clients.png"
-            if self._create_trend_chart(df, 'Date', 'Clients', 'Clients Trend', 'Clients', client_path):
+            if self._create_trend_chart(df, 'Date', 'Clients', 'Clients Trend', 'Clients', client_path, chart_type='clients'):
                 charts.append(('Clients Trend', client_path))
             
-            # Uptime Trend
+            # Uptime Trend (不带阈值线)
             uptime_path = temp_dir / f"{serial}_uptime.png"
             uptime_col = 'Uptime_Hours'
             if uptime_col in df.columns and self._create_trend_chart(df, 'Date', uptime_col, 'Uptime Trend', 'Uptime (Hours)', uptime_path):
                 charts.append(('Uptime Trend', uptime_path))
             
-            # 2G Channel Change
+            # Temperature Trend (带阈值线)
+            temp_path = temp_dir / f"{serial}_temperature.png"
+            if self._create_trend_chart(df, 'Date', 'Temperature(°C)', 'Temperature Trend', 'Temperature (°C)', temp_path, chart_type='temperature'):
+                charts.append(('Temperature Trend', temp_path))
+            
+            # 2G Channel Change (不带阈值线)
             channel_2g_path = temp_dir / f"{serial}_channel_2g.png"
             if self._create_channel_chart(df, 'Date', '2G_Channel', '2G Channel Change', channel_2g_path):
                 charts.append(('2G Channel Change', channel_2g_path))
             
-            # 5G Channel Change
+            # 5G Channel Change (不带阈值线)
             channel_5g_path = temp_dir / f"{serial}_channel_5g.png"
             if self._create_channel_chart(df, 'Date', '5G_Channel', '5G Channel Change', channel_5g_path):
                 charts.append(('5G Channel Change', channel_5g_path))
