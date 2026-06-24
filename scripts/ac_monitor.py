@@ -285,59 +285,216 @@ def parse_clients_from_associations(page):
     
     return clients
 
-def parse_health_checks_scores(page):
-    """从Health Checks表格提取健康评分 - 只提取100和0-100之间的值"""
+def _parse_relative_time(text):
+    """解析相对时间文本（如 '6 seconds ago', '52 minutes ago'）为总秒数"""
+    if not text:
+        return None
+    text = text.strip().lower()
+    # 去除 html 标签
+    text = re.sub(r'<[^>]+>', '', text)
+    
+    # 匹配 "X seconds ago", "X minutes ago", "X hours ago", "X days ago"
+    match = re.search(r'(\d+)\s*(second|minute|hour|day)s?\s*ago', text)
+    if match:
+        val = int(match.group(1))
+        unit = match.group(2)
+        if unit == 'second':
+            return val
+        elif unit == 'minute':
+            return val * 60
+        elif unit == 'hour':
+            return val * 3600
+        elif unit == 'day':
+            return val * 86400
+    
+    # 匹配纯秒数（如 "30s"）
+    match = re.search(r'^(\d+)\s*s$', text)
+    if match:
+        return int(match.group(1))
+    
+    return None
+
+
+def parse_health_checks_scores(page, max_count=50):
+    """从Health Checks表格提取健康评分
+    
+    Args:
+        page: Playwright page 对象
+        max_count: 最多取最近多少条评分（默认50，约2小时数据）
+    
+    策略：
+    1. 点击Health Checks tab
+    2. 点击Show More加载历史数据直到行数 >= max_count
+    3. 取最前面max_count条记录的Sanity列评分
+    """
     scores = []
     try:
-        health_tab = page.query_selector('button:has-text("Health Checks")')
-        if health_tab:
-            health_tab.click()
-            time.sleep(3)
+        # 1. 点击Health Checks tab
+        health_tab = None
+        for selector in [
+            'button:has-text("Health Checks")',
+            'button[role="tab"]:has-text("Health")',
+            'div[role="tab"]:has-text("Health")',
+        ]:
+            try:
+                health_tab = page.query_selector(selector)
+                if health_tab and health_tab.is_visible():
+                    break
+                health_tab = None
+            except:
+                continue
         
-        # 找到Health Checks表格 - 通常第一列是时间戳，第二列是结果，第三列是sanity分数
-        # 我们只取第三列(sanity)的数据
+        if health_tab:
+            try:
+                health_tab.click()
+                time.sleep(3)
+                log(f"    [DEBUG HEALTH] clicked Health Checks tab via {selector}")
+            except:
+                pass
+        
+        # 2. 点击 "Show More" 加载历史数据，直到行数 >= max_count（最多点5次）
+        show_more_clicks = 0
+        for _ in range(5):
+            # 检查当前是否已有足够行数
+            tables = page.query_selector_all('table')
+            for table in tables:
+                rows = table.query_selector_all('tr')
+                if len(rows) < 2:
+                    continue
+                header_cells = rows[0].query_selector_all('th, td')
+                header_text = ' '.join([cell.inner_text() for cell in header_cells]).upper()
+                if 'SANITY' in header_text or 'HEALTH' in header_text or 'CHECK' in header_text:
+                    if len(rows) - 1 >= max_count:
+                        break
+            else:
+                # 行数不够，点Show More
+                try:
+                    show_more = page.query_selector('button:has-text("Show More")')
+                    if not show_more or not show_more.is_visible():
+                        break
+                    show_more.click()
+                    show_more_clicks += 1
+                    time.sleep(2)
+                    continue
+                except:
+                    pass
+            break  # 行数够了 或 show_more不可用
+        if show_more_clicks > 0:
+            log(f"    [DEBUG HEALTH] clicked Show More {show_more_clicks}x")
+        
+        # 3. 查找Health Checks表格
         tables = page.query_selector_all('table')
+        found_table = False
         for table in tables:
             rows = table.query_selector_all('tr')
             if len(rows) < 2:
                 continue
             header_cells = rows[0].query_selector_all('th, td')
             header_text = ' '.join([cell.inner_text() for cell in header_cells]).upper()
-            # 检查是否是Health Checks表格
+            
             if 'SANITY' in header_text or 'HEALTH' in header_text or 'CHECK' in header_text:
+                found_table = True
+                # 找Sanity列索引
+                sanity_col_idx = None
+                for idx, cell in enumerate(header_cells):
+                    h = cell.inner_text().upper()
+                    if 'SANITY' in h:
+                        sanity_col_idx = idx
+                if sanity_col_idx is None:
+                    sanity_col_idx = 2  # fallback: 第三列
+                
+                log(f"    [DEBUG HEALTH] found Health table, rows={len(rows)-1}, sanity_col={sanity_col_idx}, show_more_clicks={show_more_clicks}")
+                
+                total_rows = 0
                 for row in rows[1:]:
                     cells = row.query_selector_all('td')
-                    if len(cells) >= 3:
-                        sanity_text = cells[2].inner_text().strip()  # 第三列
-                        log(f"    [DEBUG HEALTH] sanity column text: '{sanity_text}'")
-                        # 只提取有效的健康评分：100 或者 0-100的数字
-                        if sanity_text == '100':
-                            scores.append(100)
-                            log(f"    [DEBUG HEALTH] added score 100")
-                        elif sanity_text.isdigit():
-                            val = int(sanity_text)
-                            if val == 0:  # 0可能是真实健康评分
-                                scores.append(0)
-                                log(f"    [DEBUG HEALTH] added score 0")
-                            # 其他0-100的值可能是错误码，不是健康评分，跳过
-                        elif sanity_text.lower() in ['completed', 'pass', 'ok']:
-                            # 文本状态不计入评分
-                            pass
-                        else:
-                            # 尝试正则提取数字
-                            match = re.search(r'(\d+)', sanity_text)
-                            if match:
-                                val = int(match.group(1))
-                                # 只有明确的健康评分模式才添加（通常是较大值或特定模式）
-                                if val >= 50:  # 健康评分通常是50以上
-                                    scores.append(val)
-                                    log(f"    [DEBUG HEALTH] regex added score {val}")
+                    if len(cells) <= sanity_col_idx:
+                        continue
+                    total_rows += 1
+                    if total_rows > max_count:
+                        break
+                    
+                    sanity_text = cells[sanity_col_idx].inner_text().strip()
+                    score = _parse_sanity_value(sanity_text)
+                    if score is not None:
+                        scores.append(score)
+                
+                log(f"    [DEBUG HEALTH] total_rows_loaded={len(rows)-1}, collected={len(scores)} (max={max_count})")
                 break
+        
+        # 策略2：找不到header匹配的表格，尝试扫描
+        if not found_table:
+            log(f"    [DEBUG HEALTH] strategy 1 failed, trying strategy 2...")
+            for table in tables:
+                rows = table.query_selector_all('tr')
+                if len(rows) < 2:
+                    continue
+                col_values = {}
+                for row in rows[1:]:
+                    cells = row.query_selector_all('td')
+                    for ci, cell in enumerate(cells):
+                        val = _parse_sanity_value(cell.inner_text().strip())
+                        if val is not None and 0 <= val <= 100:
+                            col_values[ci] = col_values.get(ci, 0) + 1
+                
+                if col_values:
+                    best_col = max(col_values, key=col_values.get)
+                    hit_rate = col_values[best_col] / (len(rows) - 1)
+                    if hit_rate >= 0.3:
+                        log(f"    [DEBUG HEALTH] strategy 2 found col={best_col}, hit_rate={hit_rate:.1%}")
+                        for row in rows[1:]:
+                            cells = row.query_selector_all('td')
+                            if len(cells) > best_col:
+                                val = _parse_sanity_value(cells[best_col].inner_text().strip())
+                                if val is not None and 0 <= val <= 100:
+                                    scores.append(val)
+                        break
+            
     except Exception as e:
         log(f"    解析Health Checks失败: {e}")
     
-    log(f"    [DEBUG HEALTH] final scores: {scores}")
+    log(f"    [DEBUG HEALTH] final scores ({len(scores)}): {scores[:20]}{'...' if len(scores) > 20 else ''}")
     return scores
+
+
+def _parse_sanity_value(text):
+    """从sanity文本提取健康评分
+    
+    返回 int (0-100) 或 None（无法解析或非健康评分）
+    """
+    if not text:
+        return None
+    text = text.strip()
+    
+    # 纯数字（0-100）
+    if text.isdigit():
+        val = int(text)
+        if 0 <= val <= 100:
+            return val
+        return None
+    
+    # 带%的数字，如 "75%"
+    if text.endswith('%'):
+        num_part = text[:-1].strip()
+        if num_part.isdigit():
+            val = int(num_part)
+            if 0 <= val <= 100:
+                return val
+    
+    # 文本状态（completed/pass/ok/fail/error等）→ 不计入
+    if text.lower() in ['completed', 'pass', 'ok', 'fail', 'error', 'running', 'pending']:
+        return None
+    
+    # 正则提取数字（如 "75%" 已被上面处理，这里处理 "Score: 85" 等）
+    # 注意：排除负数（如 "-1"）
+    if not text.startswith('-'):
+        match = re.search(r'(\d+)', text)
+        if match:
+            val = int(match.group(1))
+            if 0 <= val <= 100:
+                return val
+    
+    return None
 
 def collect_device_detail_metrics(page, serial):
     """采集单个设备的详细指标"""
