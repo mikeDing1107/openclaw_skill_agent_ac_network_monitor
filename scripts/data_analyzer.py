@@ -120,7 +120,8 @@ class DataAnalyzer:
                         'channel_6g': [],
                         'noise_2g': [],
                         'noise_5g': [],
-                        'noise_6g': []
+                        'noise_6g': [],
+                        'traffic': {}
                     }
                 
                 # 解析运行时间为秒数
@@ -145,6 +146,23 @@ class DataAnalyzer:
                 device_history[serial]['noise_2g'].append(radios_2g.get('noise', 'N/A'))
                 device_history[serial]['noise_5g'].append(radios_5g.get('noise', 'N/A'))
                 device_history[serial]['noise_6g'].append(radios_6g.get('noise', 'N/A'))
+                
+                # 流量数据处理：对齐日期，确保所有接口有对应日期的值
+                traffic = device.get('traffic', {})
+                # 收集当前日期出现的所有接口
+                seen_ifaces = set(device_history[serial]['traffic'].keys()) | set(traffic.keys())
+                for iface in seen_ifaces:
+                    if iface not in device_history[serial]['traffic']:
+                        device_history[serial]['traffic'][iface] = {'rx_mb': [], 'tx_mb': []}
+                    # 补齐之前缺失的日期（用0填充）
+                    expected_len = len(device_history[serial]['dates']) - 1
+                    while len(device_history[serial]['traffic'][iface]['rx_mb']) < expected_len:
+                        device_history[serial]['traffic'][iface]['rx_mb'].append(0)
+                        device_history[serial]['traffic'][iface]['tx_mb'].append(0)
+                    # 添加当前日期的值
+                    stats = traffic.get(iface, {})
+                    device_history[serial]['traffic'][iface]['rx_mb'].append(stats.get('rx_mb', 0))
+                    device_history[serial]['traffic'][iface]['tx_mb'].append(stats.get('tx_mb', 0))
         
         return device_history
     
@@ -322,6 +340,40 @@ class DataAnalyzer:
         
         return output_path
     
+    def _create_combined_traffic_chart(self, dates, rx_vals, tx_vals, iface_name, output_path):
+        """创建合并 RX+TX 流量趋势图（双线 + 双均值参考线）"""
+        df = pd.DataFrame({'Date': dates, 'RX': rx_vals, 'TX': tx_vals})
+        # 至少需要 2 个数据点，且至少有 1 个非零值
+        if len(df) < 2:
+            return None
+        if sum(df['RX']) == 0 and sum(df['TX']) == 0:
+            return None
+        
+        fig, ax = plt.subplots(figsize=(10, 5))
+        
+        ax.plot(df['Date'], df['RX'], marker='o', linewidth=2, markersize=5, color='#2196F3', label='RX')
+        ax.plot(df['Date'], df['TX'], marker='s', linewidth=2, markersize=5, color='#FF5722', label='TX')
+        
+        avg_rx = np.mean(df['RX'])
+        avg_tx = np.mean(df['TX'])
+        ax.axhline(y=avg_rx, color='#2196F3', linestyle='--', linewidth=1, alpha=0.6, label=f'RX avg ({avg_rx:.1f} MB)')
+        ax.axhline(y=avg_tx, color='#FF5722', linestyle='--', linewidth=1, alpha=0.6, label=f'TX avg ({avg_tx:.1f} MB)')
+        
+        ax.set_title(f'{iface_name} Traffic (24h)', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Date', fontsize=12)
+        ax.set_ylabel('MB', fontsize=12)
+        ax.legend(loc='upper left', fontsize=9)
+        ax.grid(True, alpha=0.3)
+        
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        if len(df) > 1:
+            ax.xaxis.set_major_locator(mdates.DayLocator(interval=max(1, len(df)//5)))
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        return output_path
+    
     def generate_excel_report(self, device_history: dict) -> Path:
         """生成Excel报告，返回文件路径"""
         if not device_history:
@@ -335,6 +387,8 @@ class DataAnalyzer:
         temp_dir = tempfile.mkdtemp()
         try:
             with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+                # 首先创建流量汇总Sheet
+                self._create_traffic_summary_sheet(writer, device_history)
                 for serial, history in device_history.items():
                     self._create_device_sheet(writer, serial, history, Path(temp_dir))
         finally:
@@ -342,6 +396,55 @@ class DataAnalyzer:
             shutil.rmtree(temp_dir, ignore_errors=True)
         
         return excel_path
+    
+    def _create_traffic_summary_sheet(self, writer, device_history: dict):
+        """创建流量汇总Sheet - 显示最近一天所有AP的上行口流量"""
+        if not device_history:
+            return
+        
+        # 收集所有接口名称和最新日期的流量数据
+        iface_order = ['WAN', 'up0v149', 'up1v53']
+        all_ifaces = set()
+        rows = []
+        for serial, history in device_history.items():
+            traffic = history.get('traffic', {})
+            for iface in traffic:
+                if iface in iface_order:
+                    all_ifaces.add(iface)
+            
+            if history['dates']:
+                latest_idx = len(history['dates']) - 1
+                row_data = {
+                    'Serial': serial,
+                    'Name': history.get('name', serial),
+                    'Date': history['dates'][latest_idx].strftime('%Y-%m-%d')
+                }
+                for iface in iface_order:
+                    data = traffic.get(iface)
+                    if data and latest_idx < len(data['rx_mb']):
+                        row_data[f'{iface}_RX(MB)'] = data['rx_mb'][latest_idx]
+                        row_data[f'{iface}_TX(MB)'] = data['tx_mb'][latest_idx]
+                rows.append(row_data)
+        
+        if not rows:
+            return
+        
+        df = pd.DataFrame(rows)
+        df.to_excel(writer, sheet_name='Traffic Summary', index=False)
+        
+        # 调整列宽
+        worksheet = writer.sheets['Traffic Summary']
+        for column in worksheet.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 3, 25)
+            worksheet.column_dimensions[column_letter].width = adjusted_width
     
     def _create_device_sheet(self, writer, serial: str, history: dict, temp_dir: Path):
         """为单个设备创建Sheet"""
@@ -364,6 +467,18 @@ class DataAnalyzer:
             '5G_Noise(dB)': history['noise_5g'],
             '6G_Noise(dB)': history['noise_6g']
         })
+        
+        # 添加 VLAN 流量数据列（up0v149 + up1v53，WAN 只在 Traffic Summary 中）
+        traffic = history.get('traffic', {})
+        for iface in ['up0v149', 'up1v53']:
+            if iface in traffic:
+                it = traffic[iface]
+                rx_vals = it.get('rx_mb', [])
+                tx_vals = it.get('tx_mb', [])
+                if len(rx_vals) == len(df):
+                    df[f'{iface}_RX(MB)'] = rx_vals
+                if len(tx_vals) == len(df):
+                    df[f'{iface}_TX(MB)'] = tx_vals
         
         df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=0)
         worksheet = writer.sheets[sheet_name]
@@ -419,6 +534,23 @@ class DataAnalyzer:
             channel_5g_path = temp_dir / f"{serial}_channel_5g.png"
             if self._create_channel_chart(df, 'Date', '5G_Channel', '5G Channel Change', channel_5g_path):
                 charts.append(('5G Channel Change', channel_5g_path))
+            
+            # Traffic Trend Charts: 每个 VLAN RX+TX 合并一张图，WAN 不做图
+            traffic = history.get('traffic', {})
+            for iface in sorted(traffic.keys()):
+                if iface == 'WAN':
+                    continue
+                iface_traffic = traffic[iface]
+                rx_vals = iface_traffic.get('rx_mb', [])
+                tx_vals = iface_traffic.get('tx_mb', [])
+                if len(df) != len(rx_vals) or len(df) != len(tx_vals):
+                    continue
+                has_data = any(v != 0 for v in rx_vals) or any(v != 0 for v in tx_vals)
+                if not has_data:
+                    continue
+                path = temp_dir / f"{serial}_{iface}_traffic.png"
+                if self._create_combined_traffic_chart(df['Date'], rx_vals, tx_vals, iface, path):
+                    charts.append((f'{iface} RX+TX Traffic', path))
         
         # Insert charts into Excel
         if charts:

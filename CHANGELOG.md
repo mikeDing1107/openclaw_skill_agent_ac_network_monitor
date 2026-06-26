@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.0.3] - 2026-06-26
+### Added
+- **24h 上行口流量统计**：通过 REST API (`/api/v1/device/{serial}/statistics`) 采集每个 AP 过去 24 小时的上行口流量
+  - WAN 口：物理口计数器差值
+  - up0v149 / up1v53 VLAN 分口：per-client 无线客户端加和口径，与页面 Statistics 图表一致
+  - 结果以 MB 为单位保存至 `traffic` 字段
+- **Traffic Summary Sheet**：Excel 报告中新增流量汇总表，集中展示所有 AP 的 WAN / up0v149 / up1v53 RX/TX 流量
+- **Per-AP 流量趋势图**：每个 AP 的 Sheet 中增加各 VLAN 接口的 RX+TX 合并趋势图（含平均值参考线）
+
 ## [1.0.2] - 2026-06-24
 ### Fixed
 - `parse_health_checks_scores()`: 修复健康评分采集间歇性返回空数组的问题

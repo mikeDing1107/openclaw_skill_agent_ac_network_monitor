@@ -13,10 +13,14 @@ from playwright.sync_api import sync_playwright
 import time
 import re
 import json
+import requests
+import urllib3
+import traceback
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import smtplib
 import sys
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -171,6 +175,9 @@ def get_device_status(page):
     """获取设备在线/离线状态"""
     page_text = page.inner_text('body').lower()
     if 'disconnected' in page_text:
+        return 'offline'
+    # 进一步验证：在线设备必须能看到内存和CPU数据
+    if 'memory:' not in page_text and 'load (' not in page_text:
         return 'offline'
     return 'online'
 
@@ -513,7 +520,8 @@ def collect_device_detail_metrics(page, serial):
         'clients_2g': 0,
         'clients_5g': 0,
         'clients_6g': 0,
-        'total_clients': 0
+        'total_clients': 0,
+        'traffic': {}
     }
     
     try:
@@ -523,10 +531,12 @@ def collect_device_detail_metrics(page, serial):
         status = get_device_status(page)
         page_text = page.inner_text('body')
         
-        # 提取设备名称
-        name_match = re.search(r'Model:\s*(\S+)', page_text)
+        # 提取设备名称（Model: 后面跟着设备型号，注意排除 Revision: 等干扰行）
+        name_match = re.search(r'Model:\s*(sercomm_\S+|\S+)', page_text, re.IGNORECASE)
         if name_match:
-            metrics['name'] = name_match.group(1)
+            name_val = name_match.group(1)
+            if name_val.lower() not in ('revision:', 'revision'):
+                metrics['name'] = name_val
         
         # 提取MAC地址
         mac_match = re.search(r'MAC:\s*([0-9a-f:]{17})', page_text, re.IGNORECASE)
@@ -544,6 +554,10 @@ def collect_device_detail_metrics(page, serial):
             
             metrics['health_scores'] = parse_health_checks_scores(page)
             
+            # 采集24小时上行口流量统计
+            access_token = page.evaluate('() => sessionStorage.getItem("access_token") || ""')
+            metrics['traffic'] = collect_traffic_stats(access_token, serial)
+            
             clients = parse_clients_from_associations(page)
             metrics['clients_2g'] = clients['2G']
             metrics['clients_5g'] = clients['5G']
@@ -553,7 +567,8 @@ def collect_device_detail_metrics(page, serial):
             log(f"    状态: 在线, 内存: {metrics['memory_usage']}%, "
                 f"客户端: {metrics['total_clients']}, "
                 f"CPU负载: {metrics['cpu_load_15m']}, "
-                f"健康评分数量: {len(metrics['health_scores'])}")
+                f"健康评分数量: {len(metrics['health_scores'])}, "
+                f"流量接口数: {len(metrics['traffic'])}")
         else:
             metrics['uptime'] = 'N/A'
             log(f"    状态: 离线")
@@ -568,6 +583,112 @@ def collect_device_detail_metrics(page, serial):
             'error': str(e),
             'timestamp': datetime.now().isoformat()
         }
+
+
+def collect_traffic_stats(access_token, serial):
+    """通过REST API采集AP过去24小时的上行口流量统计
+    
+    统一口径：per-client 无线客户端加和（与页面 Statistics 图表一致）
+    数据来源：
+    1. interfaces[up*].ssids[].associations[].rx_bytes/tx_bytes → VLAN分口
+    2. link-state.upstream.WAN.counters → WAN口总流量（仅参考，不做趋势图）
+    """
+    if not access_token:
+        return {}
+    
+    try:
+        now = datetime.now()
+        start_ms = int((now - timedelta(hours=24)).timestamp() * 1000)
+        end_ms = int(now.timestamp() * 1000)
+        
+        headers = {'Authorization': f'Bearer {access_token}', 'Accept': 'application/json'}
+        url = f'https://acdemo.sercomm.com:16002/api/v1/device/{serial}/statistics'
+        params = {'start': start_ms, 'end': end_ms}
+        
+        resp = requests.get(url, headers=headers, params=params, verify=False, timeout=60)
+        if resp.status_code != 200:
+            log(f"    [TRAFFIC] API error: {resp.status_code}")
+            return {}
+        
+        data = resp.json()
+        records = data.get('data', [])
+        if not records:
+            return {}
+        
+        result = {}
+        
+        # VLAN分口流量：per-client 无线客户端加和
+        client_stats = {}  # {(iface_name, mac): {first_rx, first_tx, last_rx, last_tx}}
+        TARGET_IFACES = {'up0v149', 'up1v53'}
+        
+        for i, rec in enumerate(records):
+            for iface in rec.get('data', {}).get('interfaces', []):
+                iface_name = iface.get('name', '')
+                if iface_name not in TARGET_IFACES:
+                    continue
+                for ssid in iface.get('ssids', []):
+                    for assoc in ssid.get('associations', []):
+                        mac = assoc.get('station', '')
+                        if not mac:
+                            continue
+                        key = (iface_name, mac)
+                        rx = assoc.get('rx_bytes', 0)
+                        tx = assoc.get('tx_bytes', 0)
+                        if key not in client_stats:
+                            client_stats[key] = {'first_rx': rx, 'first_tx': tx, 'last_rx': rx, 'last_tx': tx}
+                        else:
+                            client_stats[key]['last_rx'] = rx
+                            client_stats[key]['last_tx'] = tx
+        
+        # 按 VLAN 汇总 24h delta
+        vlan_totals = {}
+        for (iface_name, mac), stats in client_stats.items():
+            rx_d = _compute_delta(stats['first_rx'], stats['last_rx'])
+            tx_d = _compute_delta(stats['first_tx'], stats['last_tx'])
+            if iface_name not in vlan_totals:
+                vlan_totals[iface_name] = {'rx': 0, 'tx': 0}
+            vlan_totals[iface_name]['rx'] += rx_d
+            vlan_totals[iface_name]['tx'] += tx_d
+        
+        for iface_name in sorted(vlan_totals.keys()):
+            totals = vlan_totals[iface_name]
+            rx_mb = round(totals['rx'] / (1024 * 1024), 2)
+            tx_mb = round(totals['tx'] / (1024 * 1024), 2)
+            if rx_mb > 0 or tx_mb > 0:
+                result[iface_name] = {'rx_mb': rx_mb, 'tx_mb': tx_mb}
+        
+        # WAN 口总流量（物理口计数器，仅参考）
+        first_ls = records[0]['data'].get('link-state', {})
+        last_ls = records[-1]['data'].get('link-state', {})
+        first_wan = first_ls.get('upstream', {}).get('WAN', {}).get('counters', {})
+        last_wan = last_ls.get('upstream', {}).get('WAN', {}).get('counters', {})
+        
+        wan_rx = _compute_delta(first_wan.get('rx_bytes', 0), last_wan.get('rx_bytes', 0))
+        wan_tx = _compute_delta(first_wan.get('tx_bytes', 0), last_wan.get('tx_bytes', 0))
+        if wan_rx > 0 or wan_tx > 0:
+            result['WAN'] = {'rx_mb': round(wan_rx / (1024 * 1024), 2),
+                            'tx_mb': round(wan_tx / (1024 * 1024), 2)}
+        
+        log(f"    [TRAFFIC] {serial}: {len(records)} recs, {len(result)} ifaces")
+        for name in ['WAN', 'up0v149', 'up1v53']:
+            if name in result:
+                s = result[name]
+                log(f"      {name}: RX={s['rx_mb']:.1f}MB TX={s['tx_mb']:.1f}MB")
+        
+        return result
+        
+    except Exception as e:
+        log(f"    [TRAFFIC] failed: {e}")
+        return {}
+
+
+def _compute_delta(first_val, last_val):
+    """计算累计计数器差值，处理重置"""
+    if last_val >= first_val:
+        return last_val - first_val
+    else:
+        return last_val
+
 
 def parse_dashboard_metrics_from_homepage(page):
     """从首页解析Dashboard汇总指标"""
@@ -707,6 +828,17 @@ def send_report_with_attachment(page_health_results, dashboard_metrics, devices_
             <tr><th>Total Clients</th><td>{clients_display}</td></tr>
         </table>
         
+    """
+    
+    # 收集所有出现过的上行口名称（用于流量表）
+    all_upstreams = set()
+    for device in devices_data:
+        for iface in device.get('traffic', {}):
+            all_upstreams.add(iface)
+    all_upstreams = sorted(all_upstreams)
+    
+    html += f"""
+        
         <h3>AP Device Details</h3>
         <table border="1" cellpadding="5">
             <tr>
@@ -755,7 +887,10 @@ def send_report_with_attachment(page_health_results, dashboard_metrics, devices_
     
     html += """
         </table>
-        <p><small>This report is automatically generated by OpenClaw. Detailed trend analysis is attached.</small></p>
+"""
+    
+    html += """
+        <p><small>This report is automatically generated by OpenClaw. Detailed trend analysis (including 24h upstream traffic) is attached.</small></p>
     </body>
     </html>
     """
@@ -918,7 +1053,15 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=['--ignore-certificate-errors', '--no-sandbox']
+            args=[
+                '--ignore-certificate-errors',
+                '--no-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu',
+                '--disable-software-rasterizer',
+                '--disable-extensions',
+                '--no-zygote',
+            ]
         )
         context = browser.new_context(ignore_https_errors=True)
         page = context.new_page()
@@ -1056,7 +1199,6 @@ def main():
             # 发送失败通知邮件
             send_failure_email(error_msg, "AC网络监控执行失败")
             
-            import traceback
             traceback.print_exc()
             
             # 退出状态码1表示失败
